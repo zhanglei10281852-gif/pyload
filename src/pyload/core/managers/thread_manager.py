@@ -1,9 +1,11 @@
 import os
+import secrets
 import subprocess
 import time
 from datetime import timedelta
-from threading import Event, Lock
+from threading import Event, RLock
 
+from ..datatypes.data import OnlineCheckStatus
 from ..datatypes.pyfile import PyFile
 from ..threads.decrypter_thread import DecrypterThread
 from ..threads.download_thread import DownloadThread
@@ -14,6 +16,61 @@ from ..utils.web.check import get_public_address
 
 # import pycurl
 
+
+#: idle interval (seconds) after which an online-check job expires
+RESULT_JOB_TTL = timedelta(minutes=5).total_seconds()
+#: interval (seconds) an expired/finished job id stays resolvable before it becomes unknown
+RESULT_JOB_TOMBSTONE_TTL = timedelta(minutes=5).total_seconds()
+#: idle interval (seconds) after which the shared url info cache is purged
+INFO_CACHE_TTL = timedelta(minutes=5).total_seconds()
+
+
+class ResultJob:
+    """
+    State of a single `checkOnlineStatus` invocation.
+
+    The result id is allocated once when the job is created and is never
+    reused within the same process. Result batches are appended by the
+    producing InfoThread and stay available for replayable polling until
+    the job expires independently of every other job.
+    """
+
+    __slots__ = (
+        "rid", "batches", "legacy_cursor", "failures", "terminal",
+        "last_activity", "terminal_at",
+    )
+
+    def __init__(self, rid):
+        self.rid = rid
+        self.batches = []  #: append-only batches, each a {url: OnlineStatus} dict
+        self.legacy_cursor = 0  #: batches already delivered on the legacy poll path
+        self.failures = []  #: OnlineCheckStatus values recorded by the producer
+        self.terminal = None  #: None while running, final OnlineCheckStatus otherwise
+        self.last_activity = time.monotonic()
+        self.terminal_at = 0.0
+
+    def touch(self):
+        self.last_activity = time.monotonic()
+
+    @property
+    def expires_at(self):
+        return self.last_activity + RESULT_JOB_TTL
+
+
+class ResultSnapshot:
+    """
+    Immutable view returned by a result poll; converted to OnlineCheck by the API.
+    """
+
+    __slots__ = ("rid", "data", "progress", "next_progress", "status", "errors")
+
+    def __init__(self, rid, data, progress=-1, next_progress=-1, status=None, errors=None):
+        self.rid = rid
+        self.data = data
+        self.progress = progress
+        self.next_progress = next_progress
+        self.status = status
+        self.errors = errors
 
 
 class ThreadManager:
@@ -37,19 +94,21 @@ class ThreadManager:
         self.reconnecting.clear()
         self.downloaded = 0  #: number of files downloaded since last cleanup
 
-        self.lock = Lock()
+        self.lock = RLock()
 
         # some operations require to fetch url info from hoster, so we caching them so it wont be done twice
         # contains a timestamp and will be purged after timeout
         self.info_cache = {}
+        # idle deadline for the shared info cache, independent from result jobs
+        self.info_cache_deadline = 0.0
 
-        # pool of ids for online check
-        self.result_ids = 0
+        # online check jobs keyed by their unique, non-reusable result id
+        self.result_jobs = {}
 
-        # threads which are fetching hoster results
-        self.info_results = {}
-        # timeout for cache purge
-        self.timestamp = 0
+        # result ids are namespaced by a random per-process epoch, so ids
+        # issued before a restart can never collide with a new job or leak data
+        self._result_epoch = secrets.randbits(32)
+        self._result_seq = 0
 
         # pycurl.global_init(pycurl.GLOBAL_DEFAULT)
 
@@ -63,44 +122,187 @@ class ThreadManager:
         thread = DownloadThread(self)
         self.threads.append(thread)
 
+    def _refresh_info_cache_deadline(self):
+        self.info_cache_deadline = time.monotonic() + INFO_CACHE_TTL
+
+    @lock
+    def refresh_info_cache(self):
+        """
+        keeps the shared url info cache alive while info threads are fetching.
+        """
+        self._refresh_info_cache_deadline()
+
     def create_info_thread(self, data, pid):
         """
         start a thread which fetches online status and other infos
         data = [ .. () .. ]
         """
-        self.timestamp = time.monotonic() + timedelta(minutes=5).total_seconds()
+        self._refresh_info_cache_deadline()
 
         InfoThread(self, data, pid)
 
     @lock
     def create_result_thread(self, data, add=False):
         """
-        creates a thread to fetch online status, returns result id.
+        creates a thread to fetch online status, returns a stable, unique
+        (and per process non-reusable) result id.
         """
-        self.timestamp = time.monotonic() + timedelta(minutes=5).total_seconds()
+        self._refresh_info_cache_deadline()
 
-        rid = self.result_ids
-        self.result_ids += 1
+        rid = self._alloc_result_id()
+
+        # add=True writes results straight to the database, nothing is polled
+        if not add:
+            self.result_jobs[rid] = ResultJob(rid)
 
         InfoThread(self, data, rid=rid, add=add)
 
         return rid
 
-    @lock
-    def get_info_result(self, rid):
-        """
-        returns result and clears it.
-        """
-        self.timestamp = time.monotonic() + timedelta(minutes=5).total_seconds()
-
-        data = self.info_results.pop(rid, {})
-        return data
+    def _alloc_result_id(self):
+        # caller must hold the lock
+        rid = (self._result_epoch << 32) | (self._result_seq & 0xFFFFFFFF)
+        self._result_seq += 1
+        return rid
 
     @lock
-    def set_info_results(self, rid, result):
-        if rid not in self.info_results:
-            self.info_results[rid] = {}
-        self.info_results[rid].update(result)
+    def touch_result_job(self, rid):
+        """
+        marks producer activity on a result job, so a slow fetch keeps the job
+        alive even while no result batch is being delivered.
+        """
+        job = self.result_jobs.get(rid)
+        if job is not None and job.terminal is None:
+            job.touch()
+
+    @lock
+    def append_result_batch(self, rid, batch):
+        """
+        appends an immutable result batch to the job. Batches are retained
+        until the job expires; polling never removes them.
+        """
+        job = self.result_jobs.get(rid)
+        if job is not None and job.terminal is None and batch:
+            job.batches.append(dict(batch))
+            job.touch()
+
+    @lock
+    def mark_result_failure(self, rid, failure):
+        """
+        records a distinguishable producer failure for the final job state
+        (e.g. OnlineCheckStatus.PLUGIN_ERROR / CONTAINER_ERROR).
+        """
+        job = self.result_jobs.get(rid)
+        if job is not None and job.terminal is None and failure not in job.failures:
+            job.failures.append(failure)
+            job.touch()
+
+    @lock
+    def finalize_result_job(self, rid):
+        """
+        marks the end of production; the final state is derived from the
+        recorded failures. Batches appended afterwards are not visible, and
+        the final batch therefore always precedes the terminal state.
+        """
+        job = self.result_jobs.get(rid)
+        if job is not None and job.terminal is None:
+            order = (
+                OnlineCheckStatus.CONTAINER_ERROR,
+                OnlineCheckStatus.PLUGIN_ERROR,
+            )
+            job.failures = [failure for failure in order if failure in job.failures]
+            job.touch()
+            job.terminal = job.failures[0] if job.failures else OnlineCheckStatus.COMPLETE
+            job.terminal_at = time.monotonic()
+
+    @lock
+    def poll_result(self, rid, progress=-1):
+        """
+        returns a ResultSnapshot for a result job.
+
+        progress < 0 (default): legacy single-consumer path returning the
+        batches accumulated since the previous legacy call, with rid=-1 once
+        the job reached a terminal state.
+
+        progress >= 0: replayable path returning all batches starting at the
+        given cursor without removing them. Repeating the same progress
+        replays the same data, so a lost reply is recovered simply by polling
+        again; multiple consumers advance independently using own cursors.
+        """
+        now = time.monotonic()
+        job = self.result_jobs.get(rid)
+
+        if job is None:
+            # the id never existed, was garbage collected or was issued by a
+            # previous process run: report an explicit terminal state instead
+            # of an ambiguous "no new data" reply
+            if progress < 0:
+                return ResultSnapshot(rid=-1, data={})
+            return ResultSnapshot(
+                rid=-1, data={}, progress=progress, next_progress=progress,
+                status=OnlineCheckStatus.UNKNOWN.value,
+            )
+
+        # lazily terminalize a job whose producer has been idle past the TTL
+        if job.terminal is None and now > job.expires_at:
+            job.terminal = OnlineCheckStatus.EXPIRED
+            job.terminal_at = now
+
+        total = len(job.batches)
+        legacy = progress < 0
+        start = job.legacy_cursor if legacy else min(max(progress, 0), total)
+
+        data = {}
+        for batch in job.batches[start:total]:
+            data.update(batch)
+
+        if legacy:
+            job.legacy_cursor = total
+
+        # reading keeps the job alive (replays, late consumers); an expired
+        # tombstone stays frozen until it is garbage collected
+        if job.terminal != OnlineCheckStatus.EXPIRED:
+            job.touch()
+
+        terminal = job.terminal is not None
+        if legacy:
+            return ResultSnapshot(rid=-1 if terminal else rid, data=data)
+
+        return ResultSnapshot(
+            rid=-1 if terminal else rid,
+            data=data,
+            progress=progress,
+            next_progress=total,
+            status=(job.terminal.value if terminal else OnlineCheckStatus.RUNNING.value),
+            errors=[failure.value for failure in job.failures] or None,
+        )
+
+    @lock
+    def purge_result_jobs(self):
+        """
+        expires idle jobs on their own timers and removes expired/finished
+        jobs only after a tombstone interval; actively producing or read
+        jobs are never touched.
+        """
+        now = time.monotonic()
+
+        for rid in tuple(self.result_jobs):
+            job = self.result_jobs[rid]
+
+            if job.terminal is None:
+                if now > job.expires_at:
+                    # the producer vanished (e.g. crashed) without finalizing
+                    job.terminal = OnlineCheckStatus.EXPIRED
+                    job.terminal_at = now
+
+            elif job.terminal == OnlineCheckStatus.EXPIRED:
+                if now > job.terminal_at + RESULT_JOB_TOMBSTONE_TTL:
+                    del self.result_jobs[rid]
+
+            elif now > job.expires_at + RESULT_JOB_TOMBSTONE_TTL:
+                # finished jobs remain replayable while they are read, then
+                # are garbage collected one tombstone interval after going idle
+                del self.result_jobs[rid]
 
     def get_active_files(self):
         active = [
@@ -145,10 +347,12 @@ class ThreadManager:
             # it may be failed non-critical so we try it again
             self.assign_job()
 
-        if (self.info_cache or self.info_results) and self.timestamp < time.monotonic():
+        if self.info_cache and self.info_cache_deadline < time.monotonic():
             self.info_cache.clear()
-            self.info_results.clear()
-            self.pyload.log.debug("Cleared Result cache")
+            self.pyload.log.debug("Cleared info cache")
+
+        if self.result_jobs:
+            self.purge_result_jobs()
 
     # ----------------------------------------------------------------------
     def try_reconnect(self):

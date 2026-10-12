@@ -1906,6 +1906,16 @@
               "type": "integer"
             },
             "description": "`ResultID`"
+          },
+          {
+            "name": "progress",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": -1
+            },
+            "description": "last acknowledged batch cursor for replayable polling;"
           }
         ],
         "responses": {
@@ -2696,13 +2706,64 @@
             "type": "integer"
           },
           "data": {
+            "default": {},
             "title": "Data",
             "type": "object"
+          },
+          "progress": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Progress"
+          },
+          "next_progress": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Next Progress"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Status"
+          },
+          "errors": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Errors"
           }
         },
         "required": [
-          "rid",
-          "data"
+          "rid"
         ],
         "title": "OnlineCheck",
         "type": "object"

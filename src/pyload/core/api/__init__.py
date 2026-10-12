@@ -691,20 +691,28 @@ class Api:
     @legacy("pollResults")
     @permission(Perms.ADD)
     @get
-    def poll_results(self, rid: int) -> OnlineCheck:
+    def poll_results(self, rid: int, progress: int = -1) -> OnlineCheck:
         """
         Polls the result available for ResultID.
 
         :param rid: `ResultID`
+        :param progress: last acknowledged batch cursor for replayable polling;
+            same cursor replays the same batches and advancing is controlled by
+            the client, so a lost reply never drops data and multiple consumers
+            do not steal results from each other. Omit (or pass -1) for legacy
+            single-consumer behavior
         :return: `OnlineCheck`, if rid is -1 then no more data available
         """
-        result = self.pyload.thread_manager.get_info_result(rid)
+        snapshot = self.pyload.thread_manager.poll_result(rid, progress)
 
-        if "ALL_INFO_FETCHED" in result:
-            del result["ALL_INFO_FETCHED"]
-            return OnlineCheck(rid=-1, data=result)
-        else:
-            return OnlineCheck(rid=rid, data=result)
+        return OnlineCheck(
+            rid=snapshot.rid,
+            data=snapshot.data,
+            progress=None if snapshot.progress < 0 else snapshot.progress,
+            next_progress=None if snapshot.next_progress < 0 else snapshot.next_progress,
+            status=snapshot.status,
+            errors=snapshot.errors,
+        )
 
     @legacy("generatePackages")
     @permission(Perms.ADD)

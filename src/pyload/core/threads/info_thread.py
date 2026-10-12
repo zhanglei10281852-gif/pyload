@@ -1,7 +1,5 @@
-import time
-from datetime import timedelta
-
 from ..api import OnlineStatus
+from ..datatypes.data import OnlineCheckStatus
 from ..datatypes.pyfile import PyFile
 from ..utils.old.packagetools import parse_names
 from .plugin_thread import PluginThread
@@ -78,47 +76,69 @@ class InfoThread(PluginThread):
             del self.cache[:]
 
         else:  #: post the results
+            try:
+                for name, url in container:
+                    # attach container content
+                    try:
+                        data = self.decrypt_container(name, url)
+                    except Exception:
+                        self.pyload.log.warning(
+                            "Could not decrypt container.",
+                            exc_info=self.pyload.debug > 1,
+                            stack_info=self.pyload.debug > 2,
+                        )
+                        self.m.mark_result_failure(
+                            self.rid, OnlineCheckStatus.CONTAINER_ERROR
+                        )
+                        data = []
 
-            for name, url in container:
-                # attach container content
-                try:
-                    data = self.decrypt_container(name, url)
-                except Exception:
-                    self.pyload.log.warning(
-                        "Could not decrypt container.",
-                        exc_info=self.pyload.debug > 1,
-                        stack_info=self.pyload.debug > 2,
-                    )
-                    data = []
+                    for url, plugin in data:
+                        if plugin in plugins:
+                            plugins[plugin].append(url)
+                        else:
+                            plugins[plugin] = [url]
 
-                for url, plugin in data:
-                    if plugin in plugins:
-                        plugins[plugin].append(url)
+                for pluginname, urls in plugins.items():
+                    # producer activity keeps the job alive while fetching,
+                    # even if no batch is produced for a while
+                    self.m.touch_result_job(self.rid)
+
+                    plugin = self.pyload.plugin_manager.get_plugin(pluginname, True)
+                    success = True
+                    if hasattr(plugin, "get_info"):
+                        success = self.fetch_for_plugin(
+                            pluginname, plugin, urls, self.update_result, True
+                        )
+
+                        # force to process cache
+                        if self.cache:
+                            self.update_result(pluginname, [], True)
+
                     else:
-                        plugins[plugin] = [url]
+                        # generate default result
+                        result = [(url, 0, 3, url) for url in urls]
 
-            self.m.info_results[self.rid] = {}
+                        self.update_result(pluginname, result, True)
 
-            for pluginname, urls in plugins.items():
-                plugin = self.pyload.plugin_manager.get_plugin(pluginname, True)
-                if hasattr(plugin, "get_info"):
-                    self.fetch_for_plugin(
-                        pluginname, plugin, urls, self.update_result, True
-                    )
+                    if not success:
+                        self.m.mark_result_failure(
+                            self.rid, OnlineCheckStatus.PLUGIN_ERROR
+                        )
+            except Exception:
+                self.pyload.log.warning(
+                    "Online status check failed.",
+                    exc_info=self.pyload.debug > 1,
+                    stack_info=self.pyload.debug > 2,
+                )
+                self.m.mark_result_failure(
+                    self.rid, OnlineCheckStatus.PLUGIN_ERROR
+                )
+            finally:
+                # guarantee a terminal state and ordered delivery: every
+                # batch was appended before the job becomes terminal
+                self.m.finalize_result_job(self.rid)
 
-                    # force to process cache
-                    if self.cache:
-                        self.update_result(pluginname, [], True)
-
-                else:
-                    # generate default result
-                    result = [(url, 0, 3, url) for url in urls]
-
-                    self.update_result(pluginname, result, True)
-
-            self.m.info_results[self.rid]["ALL_INFO_FETCHED"] = {}
-
-        self.m.timestamp = time.monotonic() + timedelta(minutes=5).total_seconds()
+        self.m.refresh_info_cache()
 
     def update_db(self, plugin, result):
         self.pyload.files.update_file_info(result, self.pid)
@@ -148,7 +168,7 @@ class InfoThread(PluginThread):
                     status.packagename = k
                     result[url] = status
 
-            self.m.set_info_results(self.rid, result)
+            self.m.append_result_batch(self.rid, result)
 
             self.cache = []
 
@@ -184,6 +204,7 @@ class InfoThread(PluginThread):
                     cb(pluginname, result)
 
             self.pyload.log.debug(f"Finished Info Fetching for {pluginname}")
+            return True
         except Exception as exc:
             self.pyload.log.warning(
                 self._("Info Fetching for {name} failed | {err}").format(
@@ -197,6 +218,8 @@ class InfoThread(PluginThread):
             if err:
                 result = [(url, 0, 3, url) for url in urls]
                 cb(pluginname, result)
+
+            return False
 
     def decrypt_container(self, plugin, url):
         data = []

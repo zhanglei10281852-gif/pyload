@@ -1,3 +1,4 @@
+from enum import Enum
 from typing import Optional, Any
 
 from pydantic import BaseModel, Field
@@ -7,6 +8,21 @@ from pyload.core.datatypes.json_schema_extras import FLOAT_JSON_SCHEMA
 from pyload.core.datatypes.json_schema_extras import INT64_JSON_SCHEMA
 from pyload.core.datatypes.json_schema_extras import OPTIONAL_FLOAT_JSON_SCHEMA
 from pyload.core.datatypes.json_schema_extras import OPTIONAL_INT64_JSON_SCHEMA
+
+
+class OnlineCheckStatus(str, Enum):
+    #: the check is still producing result batches
+    RUNNING = "running"
+    #: every result batch has been produced and the check finished cleanly
+    COMPLETE = "complete"
+    #: a hoster plugin raised while fetching online status information
+    PLUGIN_ERROR = "plugin_error"
+    #: a submitted container file could not be decrypted
+    CONTAINER_ERROR = "container_error"
+    #: the check expired before all results were produced
+    EXPIRED = "expired"
+    #: the result id is unknown (never existed, garbage collected or pre-restart)
+    UNKNOWN = "unknown"
 
 
 class AccountInfo(BaseModel):
@@ -83,7 +99,25 @@ class FileData(BaseModel):
 
 class OnlineCheck(BaseModel):
     rid: int
-    data: dict
+    data: dict = {}
+    #: batch cursor this reply starts at (echo of the poll request); absent on legacy replies
+    progress: Optional[int] = None
+    #: batch cursor to send with the next poll request
+    next_progress: Optional[int] = None
+    #: lifecycle state for cursor based polling, see `OnlineCheckStatus`
+    status: Optional[str] = None
+    #: distinct terminal failure kinds when the check did not finish cleanly
+    errors: Optional[list[str]] = None
+
+    def __iter__(self):
+        # Optional fields that were not populated are omitted from dict()/JSON
+        # output, so replies on the legacy single-consumer path stay identical
+        # to the previous {"rid": ..., "data": ...} wire format.
+        return iter(
+            (key, value)
+            for key, value in super().__iter__()
+            if value is not None
+        )
 
 
 class OnlineStatus(BaseModel):
