@@ -71,6 +71,7 @@ class BaseAddon(BasePlugin):
             "config_changed": "config_changed",
             "download_processed": "download_processed",
             "download_start": "download_start",
+            "file_deleted": "file_deleted",
             "links_added": "links_added",
             "package_deleted": "package_deleted",
             "package_failed": "package_failed",
@@ -163,6 +164,9 @@ class BaseAddon(BasePlugin):
         pass
 
     def package_processed(self, pypack):
+        pass
+
+    def file_deleted(self, fid, pid):
         pass
 
     def package_deleted(self, pid):

@@ -26,7 +26,7 @@ from ..datatypes.data import (
     AccountInfo, CaptchaTask, ConfigItem, ConfigSection, DownloadInfo, EventInfo, FileData, OldUserData, OnlineCheck,
     OnlineStatus, PackageData, ServerStatus, ServiceCall, UserData)
 from ..datatypes.enums import Destination, ElementType
-from ..datatypes.exceptions import FileDoesNotExists, PackageDoesNotExists, ServiceDoesNotExists, ServiceException
+from ..datatypes.exceptions import FileDoesNotExists, PackageDoesNotExists, RemovalError, ServiceDoesNotExists, ServiceException
 from ..datatypes.pyfile import PyFile
 from ..log_factory import LogFactory
 from ..network.request_factory import get_url
@@ -833,9 +833,20 @@ class Api:
         Deletes several file entries from pyload.
 
         :param file_ids: list of file ids
+        :raises RemovalError: if one or more entries could not be deleted
+            safely; they stay visible and the deletion can be retried
         """
+        failed = []
         for file_id in file_ids:
-            self.pyload.files.delete_link(int(file_id))
+            try:
+                self.pyload.files.delete_link(int(file_id))
+            except RemovalError as exc:
+                failed.extend(exc.file_ids or [int(file_id)])
+
+        if failed:
+            raise RemovalError(
+                "Some files could not be deleted, please retry", file_ids=failed
+            )
 
         self.pyload.files.save()
 
@@ -847,9 +858,27 @@ class Api:
         Deletes packages and containing links.
 
         :param package_ids: list of package ids
+        :raises RemovalError: if one or more packages could not be deleted
+            safely; they stay intact and the deletion can be retried
         """
+        failed = []
+        failed_files = []
         for package_id in package_ids:
-            self.pyload.files.delete_package(int(package_id))
+            try:
+                self.pyload.files.delete_package(int(package_id))
+            except RemovalError as exc:
+                if exc.package_ids:
+                    failed.extend(exc.package_ids)
+                else:
+                    failed.append(int(package_id))
+                failed_files.extend(exc.file_ids)
+
+        if failed:
+            raise RemovalError(
+                "Some packages could not be deleted, please retry",
+                file_ids=failed_files,
+                package_ids=failed,
+            )
 
         self.pyload.files.save()
 

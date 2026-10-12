@@ -126,6 +126,13 @@ class BaseDownloader(BaseHoster):
 
     # TODO: Remove in 0.6.x
     def _finalize(self):
+        if self.pyfile.removed:
+            # deletion was claimed while the transfer was winding down: do not
+            # dispatch processed/failed events or touch the (possibly gone)
+            # package, but still re-check status so the thread converges
+            self.check_status()
+            return
+
         pypack = self.pyfile.package()
 
         self.pyload.addon_manager.dispatch_event("download_processed", self.pyfile)

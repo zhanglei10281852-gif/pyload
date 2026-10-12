@@ -90,20 +90,36 @@ class FileDatabaseMethods:
 
     @style.queue
     def delete_package(self, p):
-        self.c.execute("DELETE FROM links WHERE package=?", (str(p.id),))
-        self.c.execute("DELETE FROM packages WHERE id=?", (str(p.id),))
-        self.c.execute(
-            "UPDATE packages SET packageorder=packageorder-1 WHERE packageorder > ? AND queue=?",
-            (p.order, p.queue),
-        )
+        # all-or-nothing: links, package and queue reordering are removed in a
+        # single transaction so a failure never leaves an empty shell package
+        self.c.execute("BEGIN")
+        try:
+            self.c.execute("DELETE FROM links WHERE package=?", (str(p.id),))
+            self.c.execute("DELETE FROM packages WHERE id=?", (str(p.id),))
+            self.c.execute(
+                "UPDATE packages SET packageorder=packageorder-1 WHERE packageorder > ? AND queue=?",
+                (p.order, p.queue),
+            )
+            self.c.execute("COMMIT")
+        except Exception:
+            self.c.execute("ROLLBACK")
+            raise
 
     @style.queue
     def delete_link(self, f):
-        self.c.execute("DELETE FROM links WHERE id=?", (str(f.id),))
-        self.c.execute(
-            "UPDATE links SET linkorder=linkorder-1 WHERE linkorder > ? AND package=?",
-            (f.order, str(f.packageid)),
-        )
+        # all-or-nothing: the link and the reordering of its siblings are
+        # removed in a single transaction
+        self.c.execute("BEGIN")
+        try:
+            self.c.execute("DELETE FROM links WHERE id=?", (str(f.id),))
+            self.c.execute(
+                "UPDATE links SET linkorder=linkorder-1 WHERE linkorder > ? AND package=?",
+                (f.order, str(f.packageid)),
+            )
+            self.c.execute("COMMIT")
+        except Exception:
+            self.c.execute("ROLLBACK")
+            raise
 
     @style.queue
     def get_all_links(self, q):

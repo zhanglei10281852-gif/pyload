@@ -9,6 +9,7 @@ from flask.json import jsonify
 from werkzeug.exceptions import RequestEntityTooLarge
 
 from pyload import APPID
+from pyload.core.datatypes.exceptions import RemovalError
 
 from ..api_docs.openapi_specification_generator import OpenAPISpecificationGenerator
 from ..helpers import apikey_auth, csrf_exempt, is_authenticated, rate_limit
@@ -87,6 +88,17 @@ def rpc(func, args=""):
             ))
     except RequestEntityTooLarge:
         return jsonify({"error": "Request body too large"}), 413
+    except RemovalError as exc:
+        # definite, retryable failure: nothing was partially removed
+        log.warning(f"Deletion rejected: {exc}")
+        response = jsonify(
+            {
+                "error": str(exc),
+                "retryable": True,
+                "file_ids": exc.file_ids,
+                "package_ids": exc.package_ids,
+            }
+        ), 409
     except Exception as exc:
         flask.current_app.logger.error(f"API error in '{func}'",
             exc_info=api.pyload.debug > 1,

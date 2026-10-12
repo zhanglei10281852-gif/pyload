@@ -27,3 +27,21 @@ class ServiceException(Exception):
 
     def __init__(self, msg=None):
         self.msg = msg
+
+
+class RemovalError(Exception):
+    """
+    Raised when a file or package deletion could not be completed safely.
+
+    The failure is definite but retryable: no record was removed, no deletion
+    event was dispatched and the affected entries were left in a stopped,
+    manageable state.
+    """
+
+    __slots__ = ["msg", "file_ids", "package_ids"]
+
+    def __init__(self, msg=None, file_ids=None, package_ids=None):
+        self.msg = msg
+        self.file_ids = list(file_ids or [])
+        self.package_ids = list(package_ids or [])
+        super().__init__(msg or "Deletion failed, please retry")

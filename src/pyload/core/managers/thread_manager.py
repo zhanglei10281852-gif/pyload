@@ -31,6 +31,10 @@ class ThreadManager:
         self.threads = []  #: thread list
         self.local_threads = []  #: addon+decrypter threads
 
+        #: ids of pyfiles already assigned to a download thread but not yet
+        #: actively processed (waiting in the thread's job queue)
+        self.pending_ids = set()
+
         self.pause = True
 
         self.reconnecting = Event()
@@ -117,6 +121,35 @@ class ThreadManager:
         get an id list of all pyfiles processed.
         """
         return [x.id for x in self.get_active_files()]
+
+    def register_pending(self, fid):
+        """
+        mark a pyfile id as assigned to a download thread but not active yet.
+        """
+        with self.lock:
+            self.pending_ids.add(fid)
+
+    def discard_pending(self, fid):
+        """
+        remove a pyfile id from the pending assignments.
+        """
+        with self.lock:
+            self.pending_ids.discard(fid)
+
+    def is_pending(self, fid):
+        """
+        True while the pyfile is queued inside a download thread but not
+        actively processed yet.
+        """
+        with self.lock:
+            return fid in self.pending_ids
+
+    def is_assigned(self, fid):
+        """
+        True as long as the pyfile may be touched by any worker thread, either
+        queued in a thread's job queue or actively processed.
+        """
+        return self.is_pending(fid) or fid in self.processing_ids()
 
     def run(self):
         """
@@ -317,6 +350,7 @@ class ThreadManager:
                     # self.downloaded += 1
 
                     job.set_status("starting")
+                    self.register_pending(job.id)
                     thread.put(job)
                 else:
                     # put job back

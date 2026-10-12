@@ -5,6 +5,10 @@ from ..managers.event_manager import UpdateEvent
 from ..utils import format, purge
 from ..utils.struct.lock import lock
 
+#: maximum time to wait for a download/decryption transport to honor a
+#: cancellation request before giving up and reporting a retryable failure
+ABORT_TIMEOUT = 30
+
 status_map = {
     "finished": 0,
     "offline": 1,
@@ -70,6 +74,10 @@ class PyFile:
         self.abort = False
         self.reconnected = False
 
+        #: True once deletion of this record has been claimed; worker threads
+        #: must then stop persisting state, sending events or firing callbacks
+        self.removed = False
+
         self.statusname = None
 
         self.progress = 0
@@ -129,10 +137,54 @@ class PyFile:
     def has_status(self, status):
         return status_map[status] == self.status
 
+    @lock
+    def claim_removal(self):
+        """
+        claim this pyfile for deletion.
+
+        Marks the record as being removed and requests cancellation of any
+        running transfer. Idempotent: only the first claimant gets ``True``,
+        so repeated deletions and worker epilogues cannot resurrect the record
+        or trigger duplicate callbacks.
+
+        :return: True on the first claim, False if it was already claimed
+        """
+        if self.removed:
+            return False
+
+        self.removed = True
+        self.abort = True
+        self._request_abort()
+        return True
+
+    @lock
+    def unclaim_removal(self):
+        """
+        revoke a removal claim after a deletion failed, keeping the record
+        visible and manageable.
+        """
+        self.removed = False
+
+    def _request_abort(self):
+        """
+        signal cancellation to the plugin/transport without blocking.
+        """
+        self.abort = True
+        plugin = self.plugin
+        req = getattr(plugin, "req", None) if plugin is not None else None
+        if req is not None:
+            try:
+                req.abort_downloads()
+            except Exception:
+                pass
+
     def sync(self):
         """
         sync PyFile instance with database.
         """
+        if self.removed:
+            return
+
         self.m.update_link(self)
 
     @lock
@@ -140,6 +192,19 @@ class PyFile:
         """
         sync and remove from cache.
         """
+        if self.removed:
+            # record is gone or being deleted: the worker epilogue must not
+            # write anything back, only drop its runtime resources
+            if self.has_plugin():
+                try:
+                    self.plugin.clean()
+                except Exception:
+                    pass
+                del self.plugin
+
+            self.m.release_link(self.id)
+            return
+
         # file has valid package
         if self.packageid > 0:
             self.sync()
@@ -154,6 +219,11 @@ class PyFile:
         """
         delete pyfile from database.
         """
+        if self.removed:
+            # deletion is already driven by the FileManager (or completed);
+            # a late worker epilogue must not run it a second time
+            return
+
         self.m.delete_link(self.id)
 
     def to_dict(self):
@@ -188,26 +258,50 @@ class PyFile:
             }
         }
 
-    def abort_download(self):
+    def abort_download(self, timeout=None):
         """
         abort pyfile if possible.
+
+        Requests cancellation and waits until the file is no longer assigned
+        to (or processed by) any worker thread, so its request resources are
+        being released by the worker's own epilogue.
+
+        :param timeout: maximum seconds to wait; ``None`` waits indefinitely
+        :return: True once the transfer has converged, False if the timeout
+            elapsed before the transport honored the cancellation
         """
-        while self.id in self.m.pyload.thread_manager.processing_ids():
-            self.abort = True
-            if self.plugin and self.plugin.req:
-                self.plugin.req.abort_downloads()
+        deadline = None if timeout is None else time.monotonic() + timeout
+        thread_manager = self.m.pyload.thread_manager
+
+        while self.id in thread_manager.processing_ids() or thread_manager.is_pending(
+            self.id
+        ):
+            self._request_abort()
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
+
             time.sleep(0.1)
 
         self.abort = False
-        if self.has_plugin() and self.plugin.req:
-            self.plugin.req.abort_downloads()
+        plugin = getattr(self, "plugin", None)
+        req = getattr(plugin, "req", None) if plugin is not None else None
+        if req is not None:
+            try:
+                req.abort_downloads()
+            except Exception:
+                pass
 
         self.release()
+        return True
 
     def finish_if_done(self):
         """
         set status to finish and release file if every thread is finished with it.
         """
+        if self.removed:
+            self.release()
+            return False
+
         if self.id in self.m.pyload.thread_manager.processing_ids():
             return False
 
@@ -217,6 +311,9 @@ class PyFile:
         return True
 
     def check_if_processed(self):
+        if self.removed:
+            return
+
         self.m.check_all_links_processed(self.id)
 
     def format_wait(self):
@@ -291,6 +388,9 @@ class PyFile:
             return self.size
 
     def notify_change(self):
+        if self.removed:
+            return
+
         e = UpdateEvent(
             "file", self.id, "collector" if not self.package().queue else "queue"
         )

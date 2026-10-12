@@ -322,11 +322,18 @@ class DatabaseThread(Thread):
 
         Returns:
             Any: The result returned by the executed function `f`.
+
+        Raises:
+            Exception: any exception raised by the executed function `f`,
+                so callers can react to failed writes instead of silently
+                receiving ``None``
         """
         args = (self,) + args
         job = DatabaseJob(f, *args, **kwargs)
         self.jobs.put(job)
         job.wait()
+        if job.exception:
+            raise job.exception
         return job.result
 
     @classmethod

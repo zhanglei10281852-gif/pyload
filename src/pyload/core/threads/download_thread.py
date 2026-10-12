@@ -37,10 +37,15 @@ class DownloadThread(PluginThread):
                 if self.active == "quit":
                     break
 
+                # the job is now active, pending assignment no longer applies
+                self.m.discard_pending(pyfile.id)
+
                 try:
-                    if not pyfile.has_plugin():
+                    if not pyfile.has_plugin() or pyfile.removed:
+                        # this pyfile was deleted while queueing
+                        self.active = False
+                        pyfile.release()
                         continue
-                    # this pyfile was deleted while queueing
 
                     pyfile.plugin.check_for_same_files(starting=True)
                     self.pyload.log.info(self._("Download starts: {}").format(pyfile.name))
@@ -49,6 +54,16 @@ class DownloadThread(PluginThread):
                     self.pyload.addon_manager.download_preparing(pyfile)
                     pyfile.plugin.preprocessing(self)
 
+                    if pyfile.removed:
+                        # deletion claimed while the transfer was finishing
+                        self.pyload.log.debug(
+                            self._("Download removed, skipping finalization: {}").format(
+                                pyfile.name
+                            )
+                        )
+                        self.clean(pyfile)
+                        continue
+
                     self.pyload.log.info(
                         self._("Download finished: {}").format(pyfile.name)
                     )
@@ -56,6 +71,10 @@ class DownloadThread(PluginThread):
                     self.pyload.files.check_package_finished(pyfile)
 
                 except NotImplementedError:
+                    if pyfile.removed:
+                        self.clean(pyfile)
+                        continue
+
                     self.pyload.log.error(
                         self._("Plugin {} is missing a function").format(pyfile.pluginname)
                     )
@@ -71,6 +90,15 @@ class DownloadThread(PluginThread):
                     continue
 
                 except Reconnect:
+                    if pyfile.removed or pyfile.abort:
+                        pyfile.set_status("aborted")
+                        self.pyload.log.info(
+                            self._("Download aborted: {}").format(pyfile.name)
+                        )
+                        self.clean(pyfile)
+                        continue
+
+                    self.m.register_pending(pyfile.id)
                     self.queue.put(pyfile)
                     # pyfile.req.clear_cookies()
 
@@ -80,12 +108,22 @@ class DownloadThread(PluginThread):
                     continue
 
                 except Retry as exc:
+                    if pyfile.removed or pyfile.abort:
+                        # a late retry must not resurrect a cancelled/deleted job
+                        pyfile.set_status("aborted")
+                        self.pyload.log.info(
+                            self._("Download aborted: {}").format(pyfile.name)
+                        )
+                        self.clean(pyfile)
+                        continue
+
                     reason = exc.args[0]
                     self.pyload.log.info(
                         self._("Download restarted: {name} | {msg}").format(
                             name=pyfile.name, msg=reason
                         )
                     )
+                    self.m.register_pending(pyfile.id)
                     self.queue.put(pyfile)
                     continue
 
@@ -111,7 +149,8 @@ class DownloadThread(PluginThread):
                         )
                         pyfile.error = msg
 
-                    self.pyload.addon_manager.download_failed(pyfile)
+                    if not pyfile.removed:
+                        self.pyload.addon_manager.download_failed(pyfile)
                     self.clean(pyfile)
                     continue
 
@@ -175,7 +214,8 @@ class DownloadThread(PluginThread):
 
                     self.clean(pyfile)
 
-                    self.pyload.files.check_package_finished(pyfile)
+                    if not pyfile.removed:
+                        self.pyload.files.check_package_finished(pyfile)
 
                     self.active = False
                     self.pyload.files.save()
@@ -195,10 +235,11 @@ class DownloadThread(PluginThread):
                     )
                     pyfile.error = str(exc)
 
-                    if self.pyload.debug:
+                    if self.pyload.debug and not pyfile.removed:
                         self.write_debug_report(pyfile)
 
-                    self.pyload.addon_manager.download_failed(pyfile)
+                    if not pyfile.removed:
+                        self.pyload.addon_manager.download_failed(pyfile)
                     self.clean(pyfile)
                     continue
 

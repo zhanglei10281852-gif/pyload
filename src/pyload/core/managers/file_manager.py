@@ -1,7 +1,10 @@
+import time
 from itertools import chain
 from threading import RLock
 
 from ..datatypes.enums import Destination
+from ..datatypes.exceptions import RemovalError
+from ..datatypes.pyfile import ABORT_TIMEOUT
 from ..utils.struct.lock import lock
 from .event_manager import InsertEvent, RemoveEvent, UpdateEvent
 
@@ -157,77 +160,239 @@ class FileManager:
         return last_id
 
     # ----------------------------------------------------------------------
-    @lock
     @change
     def delete_package(self, id):
         """
         delete package and all contained links.
+
+        Lifecycle: claim every running child, wait (bounded) for all of their
+        transfers to converge, delete package and links from the database in a
+        single transaction, and only then publish the removal once. If any
+        child cannot be stopped or the database write fails, every entry is
+        restored to a visible, stopped and retryable state and
+        :class:`RemovalError` is raised.
+
+        :return: True on success, False if the package did not exist
         """
-        p = self.get_package(id)
-        if not p:
+        with self.lock:
+            p = self.get_package(id)
+            if not p:
+                # repeat deletion: nothing to remove, no event or callback
+                self.release_package(id)
+                return False
+
+            oldorder = p.order
+            queue = p.queue
+
+            # all live (possibly assigned) instances of this package's files
+            children = [
+                pyfile
+                for pyfile in list(self.cache.values())
+                if pyfile.packageid == id
+            ]
+
+            # claim before signalling, so worker epilogues cannot write records
+            # back or fire late callbacks while the package is being removed
+            for pyfile in children:
+                pyfile.claim_removal()
+
+        # wait for every transfer to converge WITHOUT holding the manager lock:
+        # worker epilogues (package stats, addon callbacks) may legitimately
+        # take this lock while winding down
+        deadline = time.monotonic() + ABORT_TIMEOUT
+        unconverged = []
+        for pyfile in children:
+            remaining = deadline - time.monotonic()
+            if not pyfile.abort_download(timeout=max(remaining, 0)):
+                unconverged.append(pyfile)
+
+        if unconverged:
+            reason = self._("Transfer did not respond to cancellation in time")
+            failed_ids = [pyfile.id for pyfile in unconverged]
+            self.pyload.log.warning(
+                self._(
+                    "Deleting package {id} failed, transfer(s) {ids} did not stop"
+                ).format(id=id, ids=failed_ids)
+            )
+            with self.lock:
+                self._restore_children(children, failed_ids, reason)
+            raise RemovalError(reason, file_ids=failed_ids, package_ids=[id])
+
+        # every child is now unassigned with its request resources closed
+        with self.lock:
+            for pyfile in children:
+                self.release_link(pyfile.id)
+
+            try:
+                self.pyload.db.delete_package(p)
+                self.pyload.db.sync_save()
+                if self.pyload.db.get_package(id) is not None:
+                    raise RuntimeError("package still present after deletion")
+            except Exception as exc:
+                try:
+                    package_gone = self.pyload.db.get_package(id) is None
+                except Exception:
+                    package_gone = False
+
+                if package_gone:
+                    self.pyload.log.warning(
+                        self._(
+                            "Package {id} was deleted but the operation reported: {msg}"
+                        ).format(id=id, msg=exc)
+                    )
+                else:
+                    reason = self._("Database error while deleting package")
+                    self.pyload.log.error(
+                        self._("Deleting package {id} failed: {msg}").format(
+                            id=id, msg=exc
+                        )
+                    )
+                    self._restore_children(
+                        children, [pyfile.id for pyfile in children], reason
+                    )
+                    raise RemovalError(reason, package_ids=[id]) from exc
+
+            # removal is durable: publish exactly once
+            e = RemoveEvent("pack", id, "collector" if not queue else "queue")
+            self.pyload.event_manager.add_event(e)
+            self.pyload.addon_manager.dispatch_event("package_deleted", id)
+
             if id in self.package_cache:
                 del self.package_cache[id]
-            return
 
-        oldorder = p.order
-        queue = p.queue
+            packs = self.package_cache.values()
+            for pack in packs:
+                if pack.queue == queue and pack.order > oldorder:
+                    pack.order -= 1
+                    pack.notify_change()
 
-        e = RemoveEvent("pack", id, "collector" if not p.queue else "queue")
-
-        pyfiles = list(self.cache.values())
-        for pyfile in pyfiles:
-            if pyfile.packageid == id:
-                pyfile.abort_download()
-                pyfile.release()
-
-        self.pyload.db.delete_package(p)
-        self.pyload.event_manager.add_event(e)
-        self.pyload.addon_manager.dispatch_event("package_deleted", id)
-
-        if id in self.package_cache:
-            del self.package_cache[id]
-
-        packs = self.package_cache.values()
-        for pack in packs:
-            if pack.queue == queue and pack.order > oldorder:
-                pack.order -= 1
-                pack.notify_change()
+        return True
 
     # ----------------------------------------------------------------------
-    @lock
     @change
     def delete_link(self, id):
         """
-        deletes links.
+        delete a link.
+
+        Lifecycle: claim the file, wait (bounded) for its transfer to
+        converge, delete the record from the database, and only then publish
+        the removal once. If the transfer cannot be stopped or the database
+        write fails, the entry stays visible in a stopped, retryable state and
+        :class:`RemovalError` is raised.
+
+        :return: True on success, False if the link did not exist
         """
-        f = self.get_file(id)
-        if not f:
-            return None
+        with self.lock:
+            f = self.get_file(id)
+            if not f:
+                # repeat deletion: nothing to remove, no event or callback
+                self.release_link(id)
+                return False
 
-        pid = f.packageid
-        e = RemoveEvent("file", id, "collector" if not f.package().queue else "queue")
+            pid = f.packageid
+            oldorder = f.order
 
-        oldorder = f.order
+            package = self.get_package(pid)
+            destination = (
+                "collector" if not package or not package.queue else "queue"
+            )
 
-        if id in self.pyload.thread_manager.processing_ids():
-            self.cache[id].abort_download()
+            claimed = f.claim_removal()
 
-        if id in self.cache:
-            del self.cache[id]
+        # wait for the transfer to converge WITHOUT holding the manager lock,
+        # the worker epilogue may legitimately need it while winding down
+        converged = f.abort_download(timeout=ABORT_TIMEOUT)
 
-        self.pyload.db.delete_link(f)
+        if not converged:
+            reason = self._("Transfer did not respond to cancellation in time")
+            self.pyload.log.warning(
+                self._("Deleting link {id} failed, transfer did not stop").format(
+                    id=id
+                )
+            )
+            with self.lock:
+                self._restore_children([f], [id] if claimed else [], reason)
+            raise RemovalError(reason, file_ids=[id])
 
-        self.pyload.event_manager.add_event(e)
+        # the file is no longer assigned and its request resources are closed
+        with self.lock:
+            self.release_link(id)
 
-        p = self.get_package(pid)
-        if not len(p.get_children()):
-            p.delete()
+            deleted = False
+            try:
+                self.pyload.db.delete_link(f)
+                self.pyload.db.sync_save()
+                deleted = self.pyload.db.get_link_data(id) is None
+                if not deleted:
+                    raise RuntimeError("link still present after deletion")
+            except Exception as exc:
+                # a follow-up error may still have removed the record: verify
+                # before deciding whether the removal has to be rolled back
+                try:
+                    deleted = self.pyload.db.get_link_data(id) is None
+                except Exception:
+                    deleted = False
 
-        pyfiles = self.cache.values()
+                if deleted:
+                    self.pyload.log.warning(
+                        self._(
+                            "Link {id} was deleted but the operation reported: {msg}"
+                        ).format(id=id, msg=exc)
+                    )
+                else:
+                    reason = self._("Database error while deleting link")
+                    self.pyload.log.error(
+                        self._("Deleting link {id} failed: {msg}").format(
+                            id=id, msg=exc
+                        )
+                    )
+                    self._restore_children([f], [id], reason)
+                    raise RemovalError(reason, file_ids=[id]) from exc
+
+            # removal is durable: publish exactly once
+            self.pyload.event_manager.add_event(RemoveEvent("file", id, destination))
+
+            p = self.get_package(pid)
+            package_removed = False
+            if p is not None and not len(p.get_children()):
+                # last link removed: clean the now empty package
+                package_removed = p.delete()
+
+            if not package_removed:
+                pyfiles = self.cache.values()
+                for pyfile in pyfiles:
+                    if pyfile.packageid == pid and pyfile.order > oldorder:
+                        pyfile.order -= 1
+                        pyfile.notify_change()
+
+            self.pyload.addon_manager.dispatch_event("file_deleted", id, pid)
+
+        return True
+
+    def _restore_children(self, pyfiles, stopped_ids, reason):
+        """
+        rollback a failed removal: bring every claimed pyfile back into the
+        cache in a consistent, manageable state without persisting anything
+        for deleted records. Files whose transfer failed to converge are put
+        in the stopped (aborted), retryable state.
+        """
         for pyfile in pyfiles:
-            if pyfile.packageid == pid and pyfile.order > oldorder:
-                pyfile.order -= 1
-                pyfile.notify_change()
+            pyfile.unclaim_removal()
+            self.cache[pyfile.id] = pyfile
+
+            if pyfile.id in stopped_ids:
+                pyfile.abort = True
+                pyfile.status = 9  #: aborted: stopped and retryable
+                pyfile.error = reason
+            else:
+                pyfile.abort = False
+
+            try:
+                # persist the in-memory state the (now finished) worker left,
+                # keeping cache and database consistent after the rollback
+                pyfile.sync()
+            except Exception:
+                pass
 
     # ----------------------------------------------------------------------
     def release_link(self, id):

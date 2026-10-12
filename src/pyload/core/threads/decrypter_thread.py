@@ -30,6 +30,11 @@ class DecrypterThread(PluginThread):
         pyfile = self.active
         retry = False
 
+        if pyfile.removed:
+            # claimed for deletion before decryption even started
+            self._finish()
+            return
+
         try:
             self.pyload.log.info(
                 self._("Decrypting starts: {}").format(self.active.name)
@@ -37,6 +42,9 @@ class DecrypterThread(PluginThread):
             self.active.plugin.preprocessing(self)
 
         except NotImplementedError:
+            if self.active.removed:
+                return
+
             self.pyload.log.error(
                 self._("Plugin {} is missing a function").format(self.active.pluginname)
             )
@@ -44,6 +52,9 @@ class DecrypterThread(PluginThread):
 
         except Fail as exc:
             msg = exc.args[0]
+
+            if self.active.removed:
+                return
 
             if msg == "offline":
                 self.active.set_status("offline")
@@ -68,11 +79,22 @@ class DecrypterThread(PluginThread):
             return
 
         except Retry:
+            if self.active.removed or self.active.abort:
+                # a late retry must not resurrect a cancelled/deleted job
+                self.pyload.log.info(
+                    self._("Download aborted: {}").format(self.active.name)
+                )
+                self.active.set_status("aborted")
+                return
+
             self.pyload.log.info(self._("Retrying {}").format(self.active.name))
             retry = True
             return self.run()
 
         except Exception as exc:
+            if self.active.removed:
+                return
+
             self.active.set_status("failed")
             self.pyload.log.warning(
                 self._("Decrypting failed: {name} | {msg}").format(
@@ -90,15 +112,29 @@ class DecrypterThread(PluginThread):
 
         finally:
             if not retry:
-                self.active.release()
-                self.active = False
-                self.pyload.files.save()
-                self.m.local_threads.remove(self)
-                # exc_clear()
+                self._finish()
 
         # self.pyload.addon_manager.download_finished(pyfile)
 
         # self.m.local_threads.remove(self)
         # self.active.finish_if_done()
-        if not retry:
+        if not retry and not pyfile.removed:
             pyfile.delete()
+
+    def _finish(self):
+        """
+        worker epilogue: release resources and leave the active set, without
+        writing removed records back.
+        """
+        try:
+            self.active.release()
+        finally:
+            self.pyload.files.save()
+            try:
+                self.m.local_threads.remove(self)
+            except ValueError:
+                pass
+            # leave the active set only after the thread is unregistered,
+            # so processing_ids() never exposes a bare ``False`` entry
+            self.active = False
+            # exc_clear()
