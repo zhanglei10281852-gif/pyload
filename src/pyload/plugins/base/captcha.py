@@ -128,7 +128,12 @@ class BaseCaptcha(BasePlugin):
                     time.sleep(1)
 
             finally:
-                captcha_manager.remove_task(self.task)
+                #: a cancelled download invalidates every outstanding
+                #: credential at once; otherwise the solved/expired task
+                #: is retained briefly until the manager purges it
+                captcha_manager.finish_task(
+                    self.task, aborted=getattr(self.pyfile, "abort", False)
+                )
 
             result = self.task.result
 
@@ -178,7 +183,12 @@ class BaseCaptcha(BasePlugin):
                 time.sleep(1)
 
         finally:
-            captcha_manager.remove_task(self.task)
+            #: a cancelled download invalidates every outstanding
+            #: credential at once; otherwise the solved/expired task
+            #: is retained briefly until the manager purges it
+            captcha_manager.finish_task(
+                self.task, aborted=getattr(self.pyfile, "abort", False)
+            )
 
         result = self.task.result
 
@@ -224,7 +234,12 @@ class BaseCaptcha(BasePlugin):
                 time.sleep(1)
 
         finally:
-            captcha_manager.remove_task(self.task)
+            #: a cancelled download invalidates every outstanding
+            #: credential at once; otherwise the solved/expired task
+            #: is retained briefly until the manager purges it
+            captcha_manager.finish_task(
+                self.task, aborted=getattr(self.pyfile, "abort", False)
+            )
 
         result = self.task.result
 

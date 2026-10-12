@@ -1255,21 +1255,45 @@ class Api:
         """
         Returns a captcha task.
 
-        :param exclusive: unused
+        :param exclusive: exclusively claim the task for this caller; \
+a short-lived credential (`token`) bound to a new task generation is returned \
+and must be used to renew the lease and to submit the result, other \
+exclusive requests cannot get the same task until the lease lapses
         :return: `CaptchaTask`
         """
         self.pyload.last_client_connected = time.monotonic()
-        task = self.pyload.captcha_manager.get_task()
+        captcha_manager = self.pyload.captcha_manager
+        task = captcha_manager.get_task(exclusive=exclusive)
         if task:
-            task.set_waiting_for_user(exclusive=exclusive)
+            if exclusive:
+                token = task.owner
+            else:
+                task.set_waiting_for_user(exclusive=False)
+                token = None
+
             captcha_data, captcha_type, result_type = task.get_captcha()
             t = CaptchaTask(tid=int(task.id),
                             data=captcha_data,
                             type=captcha_type,
-                            result_type=result_type)
+                            result_type=result_type,
+                            token=token)
             return t
         else:
             return CaptchaTask(tid=-1)
+
+    @legacy("renewCaptchaTask")
+    @permission(Perms.STATUS)
+    @get
+    def renew_captcha_task(self, tid: int, token: str) -> str:
+        """
+        Renew the exclusive lease (heartbeat) on a captcha task.
+
+        :param tid: task id
+        :param token: exclusive credential returned by `getCaptchaTask`
+        :return: current task status ("user" while held, "solved" once answered)
+        """
+        self.pyload.last_client_connected = time.monotonic()
+        return self.pyload.captcha_manager.renew_lease(tid, token)
 
     @legacy("getCaptchaTaskStatus")
     @permission(Perms.STATUS)
@@ -1279,7 +1303,8 @@ class Api:
         Get information about captcha task.
 
         :param tid: task id
-        :return: string
+        :return: "waiting", "shared-user", "user" (claimed), "solved", \
+"expired", or an empty string when the task does not exist
         """
         self.pyload.last_client_connected = time.monotonic()
         t = self.pyload.captcha_manager.get_task_by_id(tid)
@@ -1288,18 +1313,21 @@ class Api:
     @legacy("setCaptchaResult")
     @permission(Perms.STATUS)
     @post
-    def set_captcha_result(self, tid: int, result: str) -> None:
+    def set_captcha_result(self, tid: int, result: str, token: str = None) -> str:
         """
         Set result for a captcha task.
 
         :param tid: task id
         :param result: captcha result
+        :param token: exclusive credential, required when the task was \
+acquired with `exclusive=True`; the submission is rejected when the task \
+generation, ownership or deadline no longer match, and only the first \
+legal result is accepted
+        :return: terminal task status
         """
         self.pyload.last_client_connected = time.monotonic()
-        task = self.pyload.captcha_manager.get_task_by_id(tid)
-        if task:
-            task.set_result(result)
-            self.pyload.captcha_manager.remove_task(task)
+        task = self.pyload.captcha_manager.submit_result(tid, result, token or None)
+        return task.get_status()
 
     @legacy("getEvents")
     @permission(Perms.STATUS)

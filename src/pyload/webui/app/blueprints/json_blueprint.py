@@ -7,6 +7,7 @@ from flask.json import jsonify
 from werkzeug.utils import secure_filename
 
 from pyload.core.api import Role
+from pyload.core.datatypes.exceptions import CaptchaTaskException
 from pyload.core.utils import format, fs
 
 from ..helpers import get_permission, login_required, permlist, render_template, set_permission
@@ -228,7 +229,13 @@ def set_captcha():
     if flask.request.method == "POST":
         tid = int(flask.request.form["cap_id"])
         result = flask.request.form["cap_result"]
-        api.set_captcha_result(tid, result)
+        try:
+            api.set_captcha_result(tid, result)
+        except CaptchaTaskException:
+            #: leased by an exclusive client, expired, or already solved by a
+            #: handler -- the shared web popup answer cannot be accepted;
+            #: simply move on and show the next pending task (if any)
+            pass
 
     task = api.get_captcha_task()
     if task.tid >= 0:

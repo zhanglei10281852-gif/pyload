@@ -27,3 +27,45 @@ class ServiceException(Exception):
 
     def __init__(self, msg=None):
         self.msg = msg
+
+
+class CaptchaTaskException(Exception):
+    """Base class for captcha task protocol violations."""
+
+    __slots__ = ["msg"]
+
+    #: suggested HTTP status code for REST clients
+    status_code = 409
+
+    def __init__(self, msg=None):
+        self.msg = msg or self.__class__.__name__
+
+
+class CaptchaTaskNotFound(CaptchaTaskException):
+    """The task id is unknown or the task was already purged."""
+
+    status_code = 404
+
+
+class CaptchaTaskExpired(CaptchaTaskException):
+    """The task overall deadline elapsed without an accepted result."""
+
+    status_code = 410
+
+
+class CaptchaTaskOwnership(CaptchaTaskException):
+    """The credential does not match the current task generation/owner."""
+
+    status_code = 409
+
+
+class CaptchaTaskSolved(CaptchaTaskException):
+    """The task was already solved by another party, it cannot be overwritten."""
+
+    status_code = 409
+
+
+class CaptchaResultInvalid(CaptchaTaskException):
+    """The submitted result cannot be parsed for the task result type."""
+
+    status_code = 400

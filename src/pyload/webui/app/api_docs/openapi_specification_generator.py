@@ -129,6 +129,8 @@ class OpenAPISpecificationGenerator:
             if param.default != inspect.Parameter.empty:
                 param_info["required"] = False
                 param_info["schema"]["default"] = param.default
+                if param.default is None:
+                    param_info["schema"]["nullable"] = True
 
             if param_description := self._parse_parameter_docstring(docstring_lines, param_name):
                 param_info["description"] = param_description

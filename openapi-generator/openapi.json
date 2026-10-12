@@ -853,7 +853,7 @@
               "type": "boolean",
               "default": false
             },
-            "description": "unused"
+            "description": "exclusively claim the task for this caller; a short-lived credential (`token`) bound to a new task generation is returned and must be used to renew the lease and to submit the result, other exclusive requests cannot get the same task until the lease lapses"
           }
         ],
         "responses": {
@@ -890,7 +890,7 @@
         ],
         "responses": {
           "200": {
-            "description": "string",
+            "description": "\"waiting\", \"shared-user\", \"user\" (claimed), \"solved\", \"expired\", or an empty string when the task does not exist",
             "content": {
               "application/json": {
                 "schema": {
@@ -2061,6 +2061,47 @@
         }
       }
     },
+    "/api/renew_captcha_task": {
+      "get": {
+        "summary": "Renew the exclusive lease (heartbeat) on a captcha task.",
+        "description": "Renew the exclusive lease (heartbeat) on a captcha task.",
+        "tags": [
+          "pyLoad REST"
+        ],
+        "parameters": [
+          {
+            "name": "tid",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            },
+            "description": "task id"
+          },
+          {
+            "name": "token",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "exclusive credential returned by `getCaptchaTask`"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "current task status (\"user\" while held, \"solved\" once answered)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/restart": {
       "post": {
         "summary": "Restart pyload core.",
@@ -2214,11 +2255,29 @@
               "type": "string"
             },
             "description": "captcha result"
+          },
+          {
+            "name": "token",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": null,
+              "nullable": true
+            },
+            "description": "exclusive credential, required when the task was acquired with `exclusive=True`; the submission is rejected when the task generation, ownership or deadline no longer match, and only the first legal result is accepted"
           }
         ],
         "responses": {
           "200": {
-            "description": "No response"
+            "description": "terminal task status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -2949,6 +3008,18 @@
             ],
             "default": null,
             "title": "Result Type"
+          },
+          "token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Token"
           }
         },
         "required": [

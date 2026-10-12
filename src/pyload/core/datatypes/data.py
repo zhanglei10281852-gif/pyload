@@ -24,6 +24,9 @@ class CaptchaTask(BaseModel):
     data: Optional[dict] = None
     type: Optional[str] = None
     result_type: Optional[str] = None
+    #: short-lived exclusive credential, only set for `getCaptchaTask(exclusive=True)`;
+    #: must be used for lease renewal (`renewCaptchaTask`) and result submission
+    token: Optional[str] = None
 
 
 class ConfigItem(BaseModel):

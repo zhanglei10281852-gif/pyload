@@ -9,6 +9,7 @@ from flask.json import jsonify
 from werkzeug.exceptions import RequestEntityTooLarge
 
 from pyload import APPID
+from pyload.core.datatypes.exceptions import CaptchaTaskException
 
 from ..api_docs.openapi_specification_generator import OpenAPISpecificationGenerator
 from ..helpers import apikey_auth, csrf_exempt, is_authenticated, rate_limit
@@ -87,6 +88,9 @@ def rpc(func, args=""):
             ))
     except RequestEntityTooLarge:
         return jsonify({"error": "Request body too large"}), 413
+    except CaptchaTaskException as exc:
+        #: lost ownership, stale generation/credential, expired or already solved
+        return jsonify({"error": exc.msg}), exc.status_code
     except Exception as exc:
         flask.current_app.logger.error(f"API error in '{func}'",
             exc_info=api.pyload.debug > 1,
