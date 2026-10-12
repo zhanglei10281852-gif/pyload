@@ -1,3 +1,20 @@
+diff --git a/evidence/rubric-comparison.txt b/evidence/rubric-comparison.txt
+new file mode 100644
+index 000000000..e2b1b5ecf
+--- /dev/null
++++ b/evidence/rubric-comparison.txt
+@@ -0,0 +1,11 @@
++项目：pyload-project-02｜让在线检查结果可重放且跨重启隔离
++Session：6acccfe3d269323004075209｜有效轮数：95｜Harness：Trae
++验证摘要：focused 23 passed；unit 149 passed, 4 skipped；integration 30 passed；受控检查复现慢生产者过期、重启 RID 冲突与 JavaScript 整数精度丢失。
++
++Rubric ID：1｜状态：通过｜期望行为：同一在线检查进度的重复轮询可重放同一批数据，只有明确推进后才返回后续批次，模拟响应丢失不会遗漏 URL 结果。｜实际观察：poll_result 对 progress>=0 只读取 append-only batches，不删除数据；相同 progress=0 重复返回相同批次，新增批次后旧 cursor 返回完整 u1、u2。｜直接证据：src/pyload/core/managers/thread_manager.py:218-278；test_same_progress_replays_same_data_and_lost_reply_is_recovered 通过。
++Rubric ID：2｜状态：通过｜期望行为：两个消费者并发轮询同一作业时拥有独立进度，任何一方的读取、重试或确认都不会窃取、跳过或重复推进另一方。｜实际观察：新协议不保存消费者 cursor，两个 progress=0 请求均读到 u1、u2，一方推进到 2 后另一方仍能从 0 读取完整批次。｜直接证据：src/pyload/core/managers/thread_manager.py:251-278；test_multiple_consumers_advance_without_stealing_results 与 test_legacy_and_cursor_consumers_do_not_steal_from_each_other 通过。
++Rubric ID：3｜状态：通过｜期望行为：InfoThread 的部分批次、最后一批和 completed 终态保持稳定顺序，客户端能在取得全部结果后观察到既有 rid=-1 完成语义。｜实际观察：append_result_batch 在 finalize_result_job 前执行，终态轮询同时返回最后数据、status=complete 和 rid=-1，同 cursor 可重放；旧路径终态仍返回 rid=-1。｜直接证据：src/pyload/core/threads/info_thread.py:101-140、168；src/pyload/core/managers/thread_manager.py:200-217；test_last_batch_and_completion_are_visible_together_and_in_order 通过。
++Rubric ID：4｜状态：未通过｜期望行为：每个作业独立过期，清理闲置作业不影响仍活跃的作业；插件异常、容器失败和过期分别产生可确定且可区分的终态。｜实际观察：生产者仅在进入插件调用前 touch；将 last_activity 回拨 TTL+1 并在插件仍运行时 purge，作业立即变为 expired，后续 append 被拒绝，最终返回 data=[]。｜直接证据：src/pyload/core/threads/info_thread.py:101-110；src/pyload/core/managers/thread_manager.py:174-187、289-305；受控 ttl 输出 terminal=expired、producer_batch_count=0。｜原因：单次插件调用超过作业 TTL 时仍在运行的生产者被标记 expired，随后生成的结果批次被丢弃｜影响：慢插件的真实结果永久缺失，客户端把仍在执行的检查观察为过期终态｜证据位置：src/pyload/core/threads/info_thread.py:101-110；src/pyload/core/managers/thread_manager.py:184-187、292-300；受控 ttl 输出
++Rubric ID：5｜状态：未通过｜期望行为：服务重启后旧作业身份明确返回未知或过期，新的检查不会复用身份而把其结果交给重启前的轮询者。｜实际观察：RID 仅由随机 32 位进程纪元和从零开始的序号组成；受控令两次启动返回相同纪元后，old_rid 与 new_rid 完全相同，旧轮询得到 status=complete 和新作业数据。｜直接证据：src/pyload/core/managers/thread_manager.py:108-111、162-166；受控 restart 输出 same_identity=True、old_poller_data=['new-job-result']。｜原因：两次进程启动取得相同 32 位纪元时新旧 RID 完全相同，旧轮询者读取到新作业结果｜影响：重启前客户端能把重启后的另一作业结果误认为原作业结果，跨作业隔离失效｜证据位置：src/pyload/core/managers/thread_manager.py:108-111、162-166；受控 restart 输出
++Rubric ID：6｜状态：未通过｜期望行为：单消费者旧式调用仍可使用现有 checkOnlineStatus、pollResults、OnlineCheck 字段和 rid=-1，不启用进度能力时行为兼容。｜实际观察：RID 最大可达 18446744069414584320，JavaScript Number 解析为 18446744069414584000 且 Number.isSafeInteger=false，旧浏览器客户端无法把收到的 RID 原样传回 pollResults。｜直接证据：src/pyload/core/managers/thread_manager.py:162-166；Node JSON 数值往返输出 exact 与 parsed 不相等。｜原因：生成的 64 位无符号 RID 超出 JavaScript 安全整数范围，浏览器解析后数值改变｜影响：旧式浏览器调用方使用失真的 RID 轮询时得到未知作业，兼容路径中断｜证据位置：src/pyload/core/managers/thread_manager.py:162-166；Node roundTrip=false 输出
++Rubric ID：7｜状态：通过｜期望行为：缓存命中、插件默认 unknown、按插件分组和容器预解密的正常结果保持现有名称、大小、状态和包名解析行为。｜实际观察：InfoThread 保留 fetch_for_plugin、info_cache、默认 status=3、容器解密和 parse_names 数据构造路径；成功插件返回 name、size、status，默认插件返回 unknown，完整集成套件通过。｜直接证据：src/pyload/core/threads/info_thread.py:30-125、143-222；test_info_thread_delivers_default_results_and_completes、test_info_thread_successful_plugin_get_info；集成 30 passed。
 diff --git a/evidence/screenshots/01-rubric-comparison.png b/evidence/screenshots/01-rubric-comparison.png
 new file mode 100644
 index 0000000000000000000000000000000000000000..a915350965adc311ed031d225201e8ad27dde405
@@ -1133,6 +1150,34 @@ eKk~fN9+vdSKdt`ZH~#@1=npZ6IzRaMAO8a$hCT5B
 literal 0
 HcmV?d00001
 
+diff --git a/evidence/verify_rubric.yaml b/evidence/verify_rubric.yaml
+new file mode 100644
+index 000000000..71531e6ee
+--- /dev/null
++++ b/evidence/verify_rubric.yaml
+@@ -0,0 +1,22 @@
++rubrics:
++  - id: 1
++    type: f2p
++    text: 同一在线检查进度的重复轮询可重放同一批数据，只有明确推进后才返回后续批次，模拟响应丢失不会遗漏 URL 结果。
++  - id: 2
++    type: f2p
++    text: 两个消费者并发轮询同一作业时拥有独立进度，任何一方的读取、重试或确认都不会窃取、跳过或重复推进另一方。
++  - id: 3
++    type: f2p
++    text: InfoThread 的部分批次、最后一批和 completed 终态保持稳定顺序，客户端能在取得全部结果后观察到既有 rid=-1 完成语义。
++  - id: 4
++    type: f2p
++    text: 每个作业独立过期，清理闲置作业不影响仍活跃的作业；插件异常、容器失败和过期分别产生可确定且可区分的终态。
++  - id: 5
++    type: f2p
++    text: 服务重启后旧作业身份明确返回未知或过期，新的检查不会复用身份而把其结果交给重启前的轮询者。
++  - id: 6
++    type: p2p
++    text: 单消费者旧式调用仍可使用现有 checkOnlineStatus、pollResults、OnlineCheck 字段和 rid=-1，不启用进度能力时行为兼容。
++  - id: 7
++    type: p2p
++    text: 缓存命中、插件默认 unknown、按插件分组和容器预解密的正常结果保持现有名称、大小、状态和包名解析行为。
 diff --git a/openapi-generator/openapi.json b/openapi-generator/openapi.json
 index def8a94b4..3fe1287a5 100644
 --- a/openapi-generator/openapi.json
